@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MP3 → Bytebeat (conversor web)</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;max-width:900px;margin:24px auto;padding:0 16px;color:#111}
+    h1{font-size:1.4rem}
+    label{display:block;margin:12px 0 4px}
+    input,button,select,textarea{font:inherit}
+    .row{display:flex;gap:8px;align-items:center}
+    .controls{margin-bottom:16px}
+    textarea{width:100%;height:260px;margin-top:12px;font-family:monospace;white-space:pre;overflow:auto}
+    button{padding:8px 12px;border-radius:6px;border:1px solid #bbb;background:#f6f6f6}
+    button.primary{background:#0366d6;color:white;border-color:#0366d6}
+    .small{font-size:0.9rem;color:#444}
+    .status{margin-top:8px;color:#0366d6}
+  </style>
+</head>
+<body>
+  <h1>MP3 → Bytebeat (conversor web)</h1>
+  <p class="small">Escolha um arquivo MP3, configure a taxa de amostragem de saída e o comprimento máximo do array. O conversor roda no seu navegador e gera um arquivo JavaScript com <code>const data = [...];</code> e <code>function bytebeat(t)</code>.</p>
+
+  <div class="controls">
+    <label for="file">Arquivo MP3</label>
+    <input id="file" type="file" accept="audio/*">
+
+    <div style="display:flex;gap:12px;margin-top:8px;flex-wrap:wrap;align-items:center">
+      <div>
+        <label for="samplerate">Taxa de amostragem (Hz)</label>
+        <input id="samplerate" type="number" value="8000" min="100" step="100">
+      </div>
+
+      <div>
+        <label for="maxlen">Comprimento máximo do array</label>
+        <input id="maxlen" type="number" value="65536" min="16" step="1">
+      </div>
+
+      <div style="align-self:flex-end">
+        <button id="convert" class="primary">Converter</button>
+      </div>
+    </div>
+
+    <div class="status" id="status"></div>
+  </div>
+
+  <div>
+    <button id="play" disabled>Play Bytebeat</button>
+    <button id="download" disabled>Baixar out.js</button>
+  </div>
+
+  <label for="jsout">Código JS gerado</label>
+  <textarea id="jsout" readonly placeholder="O código gerado aparecerá aqui..."></textarea>
+
+  <script>
+    const fileInput = document.getElementById('file');
+    const convertBtn = document.getElementById('convert');
+    const samplerateIn = document.getElementById('samplerate');
+    const maxlenIn = document.getElementById('maxlen');
+    const status = document.getElementById('status');
+    const jsout = document.getElementById('jsout');
+    const playBtn = document.getElementById('play');
+    const downloadBtn = document.getElementById('download');
+
+    let generated = null; // {sampleRate, dataUint8, filename}
+
+    function setStatus(s){ status.textContent = s; }
+
+    function floatToU8(v){
+      // v expected in -1..1
+      let x = Math.round((v + 1) * 127.5);
+      if (x < 0) x = 0; if (x > 255) x = 255; return x;
+    }
+
+    function shrinkToMax(data, maxLen){
+      if (data.length <= maxLen) return data;
+      const factor = Math.ceil(data.length / maxLen);
+      setStatus(`Reduzindo comprimento: ${data.length} → fator de decimação ${factor}`);
+      const out = new Uint8Array(Math.ceil(data.length / factor));
+      let i = 0;
+      for (let j = 0; j < data.length; j += factor){ out[i++] = data[j]; }
+      return out;
+    }
+
+    async function decodeAndResample(arrayBuffer, targetSampleRate){
+      // Decode original
+      const ac = new (window.AudioContext || window.webkitAudioContext)();
+      const decoded = await ac.decodeAudioData(arrayBuffer.slice(0));
+      // Mix to mono by averaging channels
+      const numChannels = decoded.numberOfChannels;
+      const length = Math.ceil(decoded.duration * targetSampleRate);
+      // Use OfflineAudioContext to resample and render mono
+      const offline = new OfflineAudioContext(1, length, targetSampleRate);
+      const buffer = offline.createBuffer(1, decoded.length, decoded.sampleRate);
+      const outBuf = buffer.getChannelData(0);
+      // mix channels into buffer at original sampleRate
+      for (let ch = 0; ch < numChannels; ch++){
+        const channelData = decoded.getChannelData(ch);
+        for (let i = 0; i < channelData.length; i++){
+          outBuf[i] = (outBuf[i] || 0) + channelData[i] / numChannels;
+        }
+      }
+      // Create a buffer source from mixed buffer
+      const src = offline.createBufferSource();
+      src.buffer = buffer;
+      src.connect(offline.destination);
+      src.start(0);
+      const rendered = await offline.startRendering();
+      ac.close();
+      return rendered.getChannelData(0); // Float32Array at targetSampleRate
+    }
+
+    function generateJS(sampleRate, u8arr, originalName){
+      const n = u8arr.length;
+      const perLine = 20;
+      let lines = [];
+      for (let i = 0; i < n; i += perLine){
+        const slice = Array.from(u8arr.slice(i, i + perLine)).join(', ');
+        lines.push('  ' + slice);
+      }
+      const arrText = '[\n' + lines.join(',\n') + '\n]';
+      const header = `// Gerado pelo conversor web a partir de: ${originalName}\n// samplerate: ${sampleRate}, length: ${n}\n\n`;
+      const body = `const SAMPLE_RATE = ${sampleRate};\nconst data = ${arrText};\n\nfunction bytebeat(t){\n  return data[t % data.length];\n}\n`;
+      return header + body;
+    }
+
+    convertBtn.addEventListener('click', async () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file){ alert('Escolha um arquivo MP3 primeiro.'); return; }
+      const sr = parseInt(samplerateIn.value, 10) || 8000;
+      const maxlen = parseInt(maxlenIn.value, 10) || 65536;
+      setStatus('Lendo arquivo...');
+      const ab = await file.arrayBuffer();
+      setStatus('Decodificando e resample para ' + sr + ' Hz (pode demorar)...');
+      try{
+        const floatData = await decodeAndResample(ab, sr);
+        setStatus('Convertendo amplitude para 0..255...');
+        const u8 = new Uint8Array(floatData.length);
+        for (let i = 0; i < floatData.length; i++){
+          u8[i] = floatToU8(floatData[i]);
+        }
+        const shrunk = shrinkToMax(u8, maxlen);
+        const js = generateJS(sr, shrunk, file.name);
+        jsout.value = js;
+        generated = { sampleRate: sr, data: shrunk, filename: file.name };
+        setStatus(`Pronto — tamanho final: ${shrunk.length} bytes`);
+        playBtn.disabled = false;
+        downloadBtn.disabled = false;
+      }catch(err){
+        console.error(err);
+        setStatus('Erro ao processar: ' + err.message);
+      }
+    });
+
+    playBtn.addEventListener('click', async () => {
+      if (!generated) return;
+      setStatus('Gerando buffer de reprodução...');
+      // Cria AudioBuffer com sampleRate = generated.sampleRate
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const len = generated.data.length;
+      const buf = ctx.createBuffer(1, len, generated.sampleRate);
+      const ch = buf.getChannelData(0);
+      for (let i = 0; i < len; i++){
+        ch[i] = (generated.data[i] - 128) / 128; // -1..1
+      }
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.start();
+      setStatus('Reproduzindo (atenção ao volume) — o áudio será tocado com a taxa de amostragem do bytebeat.');
+    });
+
+    downloadBtn.addEventListener('click', () => {
+      if (!generated) return;
+      const js = generateJS(generated.sampleRate, generated.data, generated.filename);
+      const blob = new Blob([js], {type: 'application/javascript;charset=utf-8'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'out.js';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+  </script>
+</body>
+</html>
